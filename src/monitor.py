@@ -4,6 +4,7 @@ from typing import List, Dict, Any
 from solders.pubkey import Pubkey
 from solana.rpc.api import Client
 from .solana_utils import lamports_to_sol
+from . import config
 
 def fetch_new_sigs(client: Client, addr: str, seen: set, limit: int = 25) -> List[str]:
     """Return new signatures not in 'seen', oldest-first per elaborazione cronologica."""
@@ -13,7 +14,7 @@ def fetch_new_sigs(client: Client, addr: str, seen: set, limit: int = 25) -> Lis
     return [s for s in sigs if s not in seen]
 
 def _get_tx_json_parsed(client: Client, sig: str) -> Dict[str, Any] | None:
-    """Ottiene JSON puro da getTransaction in jsonParsed (evita differenze di versione)."""
+    """Ottiene JSON puro da getTransaction in jsonParsed (robusto a differenze di versione)."""
     try:
         raw = client._provider.make_request(  # type: ignore[attr-defined]
             "getTransaction",
@@ -24,13 +25,32 @@ def _get_tx_json_parsed(client: Client, sig: str) -> Dict[str, Any] | None:
     except Exception:
         return None
 
+def _collect_all_account_keys(msg: Dict[str, Any]) -> List[str]:
+    """Concatena message.accountKeys + loadedAddresses.{writable,readonly} se presenti."""
+    keys: List[str] = []
+    ak = msg.get("accountKeys") or []
+    for k in ak:
+        if isinstance(k, dict) and "pubkey" in k:
+            keys.append(k["pubkey"])
+        else:
+            keys.append(str(k))
+
+    la = msg.get("loadedAddresses") or {}
+    for bucket in ("writable", "readonly"):
+        arr = la.get(bucket) or []
+        for v in arr:
+            # elementi sono stringhe base58
+            keys.append(str(v))
+    return keys
+
 def parse_pump_action(client: Client, target_addr: str, sig: str) -> List[Dict[str, Any]]:
     """
     Ritorna eventi:
       { 'kind': 'BUY'|'SELL', 'mint': str, 'sol_delta': float, 'token_delta': float, 'sig': str }
-    token_delta > 0 => BUY (target aumenta token), <0 => SELL. Filtra i mint che terminano con 'pump'.
+    token_delta > 0 => BUY (target aumenta token), <0 => SELL.
     """
     out: List[Dict[str, Any]] = []
+
     tx = _get_tx_json_parsed(client, sig)
     if not tx:
         return out
@@ -40,18 +60,17 @@ def parse_pump_action(client: Client, target_addr: str, sig: str) -> List[Dict[s
     post_bal = meta.get("postBalances") or []
 
     msg = ((tx.get("transaction") or {}).get("message")) or {}
-    ak = msg.get("accountKeys") or []
-    # accountKeys in jsonParsed è una lista di dict con "pubkey" e flag
-    account_keys: List[str] = [k["pubkey"] if isinstance(k, dict) else str(k) for k in ak]
+    account_keys = _collect_all_account_keys(msg)
 
+    # Calcolo lamports_delta se riusciamo a trovare l'indice; altrimenti 0
+    lamports_delta = 0
     try:
         idx = account_keys.index(target_addr)
+        if idx < len(pre_bal) and idx < len(post_bal):
+            lamports_delta = (post_bal[idx] - pre_bal[idx])
     except ValueError:
-        return out
-
-    lamports_delta = 0
-    if idx < len(pre_bal) and idx < len(post_bal):
-        lamports_delta = (post_bal[idx] - pre_bal[idx])
+        # OK: non blocchiamo la rilevazione — useremo comunque i delta token
+        lamports_delta = 0
 
     pre_tokens = meta.get("preTokenBalances") or []
     post_tokens = meta.get("postTokenBalances") or []
@@ -63,8 +82,13 @@ def parse_pump_action(client: Client, target_addr: str, sig: str) -> List[Dict[s
             owner = r.get("owner")
             acct_idx = r.get("accountIndex")
             owner_pk = owner
-            if owner_pk is None and acct_idx is not None and 0 <= int(acct_idx) < len(account_keys):
-                owner_pk = account_keys[int(acct_idx)]
+            if owner_pk is None and acct_idx is not None:
+                try:
+                    ai = int(acct_idx)
+                    if 0 <= ai < len(account_keys):
+                        owner_pk = account_keys[ai]
+                except Exception:
+                    pass
             if owner_pk != target_addr:
                 continue
             mint = r.get("mint")
@@ -82,8 +106,13 @@ def parse_pump_action(client: Client, target_addr: str, sig: str) -> List[Dict[s
     post_map = to_map(post_tokens)
     all_mints = set(pre_map.keys()) | set(post_map.keys())
 
+    # opzionale: filtra solo token pump.fun
+    pump_only = getattr(config, "PUMP_ONLY", True)
+
     for mint in all_mints:
-        if not mint or not mint.endswith("pump"):
+        if not mint:
+            continue
+        if pump_only and not mint.endswith("pump"):
             continue
         pre_amt, _ = pre_map.get(mint, (0.0, 6))
         post_amt, _ = post_map.get(mint, (0.0, 6))
