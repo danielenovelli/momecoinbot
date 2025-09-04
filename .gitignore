@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.pytest_cache/
+
+# Virtual env
+.venv/
+venv/
+env/
+
+# OS / Editors
+.DS_Store
+.idea/
+.vscode/
+
+# Project artifacts
+.env
+copytrader_log.csv
+state.json
+*.log
+
