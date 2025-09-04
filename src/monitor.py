@@ -34,12 +34,10 @@ def _collect_all_account_keys(msg: Dict[str, Any]) -> List[str]:
             keys.append(k["pubkey"])
         else:
             keys.append(str(k))
-
     la = msg.get("loadedAddresses") or {}
     for bucket in ("writable", "readonly"):
         arr = la.get(bucket) or []
         for v in arr:
-            # elementi sono stringhe base58
             keys.append(str(v))
     return keys
 
@@ -50,7 +48,6 @@ def parse_pump_action(client: Client, target_addr: str, sig: str) -> List[Dict[s
     token_delta > 0 => BUY (target aumenta token), <0 => SELL.
     """
     out: List[Dict[str, Any]] = []
-
     tx = _get_tx_json_parsed(client, sig)
     if not tx:
         return out
@@ -58,19 +55,17 @@ def parse_pump_action(client: Client, target_addr: str, sig: str) -> List[Dict[s
     meta = tx.get("meta") or {}
     pre_bal = meta.get("preBalances") or []
     post_bal = meta.get("postBalances") or []
-
     msg = ((tx.get("transaction") or {}).get("message")) or {}
     account_keys = _collect_all_account_keys(msg)
 
-    # Calcolo lamports_delta se riusciamo a trovare l'indice; altrimenti 0
+    # calcolo lamports_delta se troviamo l'indice del target tra tutte le keys (incluse LUT)
     lamports_delta = 0
     try:
         idx = account_keys.index(target_addr)
         if idx < len(pre_bal) and idx < len(post_bal):
             lamports_delta = (post_bal[idx] - pre_bal[idx])
     except ValueError:
-        # OK: non blocchiamo la rilevazione — useremo comunque i delta token
-        lamports_delta = 0
+        lamports_delta = 0  # non bloccare la rilevazione: useremo i delta token
 
     pre_tokens = meta.get("preTokenBalances") or []
     post_tokens = meta.get("postTokenBalances") or []
@@ -78,7 +73,6 @@ def parse_pump_action(client: Client, target_addr: str, sig: str) -> List[Dict[s
     def to_map(recs):
         m: Dict[str, tuple[float, int]] = {}
         for r in recs:
-            # record: {mint, owner?, uiTokenAmount:{uiAmount,decimals}, accountIndex?}
             owner = r.get("owner")
             acct_idx = r.get("accountIndex")
             owner_pk = owner
@@ -106,7 +100,6 @@ def parse_pump_action(client: Client, target_addr: str, sig: str) -> List[Dict[s
     post_map = to_map(post_tokens)
     all_mints = set(pre_map.keys()) | set(post_map.keys())
 
-    # opzionale: filtra solo token pump.fun
     pump_only = getattr(config, "PUMP_ONLY", True)
 
     for mint in all_mints:
