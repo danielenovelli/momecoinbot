@@ -26,3 +26,4 @@ USE_HELIUS_ONLY = os.getenv("USE_HELIUS_ONLY", "true").lower() == "true"
 SOL_MINT = "So11111111111111111111111111111111111111112"
 IGNORE_SOL_MINT = os.getenv("IGNORE_SOL_MINT", "true").lower() == "true"
 MIN_TOKEN_UI = float(os.getenv("MIN_TOKEN_UI", "0.0"))
+DAILY_SOL_BUDGET = float(os.getenv("DAILY_SOL_BUDGET", "0"))
