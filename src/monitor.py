@@ -1,123 +1,103 @@
-# src/monitor.py — legge le tx del wallet target e produce eventi BUY/SELL
 from __future__ import annotations
 from typing import List, Dict, Any
 from solders.pubkey import Pubkey
 from solana.rpc.api import Client
-from .solana_utils import lamports_to_sol
+from .utils import lamports_to_sol
 from . import config
 
 def fetch_new_sigs(client: Client, addr: str, seen: set, limit: int = 25) -> List[str]:
-    """Return new signatures not in 'seen', oldest-first per elaborazione cronologica."""
     resp = client.get_signatures_for_address(Pubkey.from_string(addr), limit=limit)
     sigs = [str(x.signature) for x in resp.value]
     sigs = list(reversed(sigs))
     return [s for s in sigs if s not in seen]
 
-def _get_tx_json_parsed(client: Client, sig: str) -> Dict[str, Any] | None:
-    """Ottiene JSON puro da getTransaction in jsonParsed (robusto a differenze di versione)."""
+def _get_tx_parsed(client: Client, sig: str) -> Dict[str, Any] | None:
     try:
-        raw = client._provider.make_request(  # type: ignore[attr-defined]
-            "getTransaction",
-            sig,
-            {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0},
-        )
+        raw = client._provider.make_request("getTransaction", sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0})
         return raw.get("result")
     except Exception:
         return None
 
-def _collect_all_account_keys(msg: Dict[str, Any]) -> List[str]:
-    """Concatena message.accountKeys + loadedAddresses.{writable,readonly} se presenti."""
+def _account_keys(msg: Dict[str, Any]) -> List[str]:
     keys: List[str] = []
-    ak = msg.get("accountKeys") or []
-    for k in ak:
-        if isinstance(k, dict) and "pubkey" in k:
-            keys.append(k["pubkey"])
-        else:
-            keys.append(str(k))
+    for k in (msg.get("accountKeys") or []):
+        keys.append(k["pubkey"] if isinstance(k, dict) and "pubkey" in k else str(k))
     la = msg.get("loadedAddresses") or {}
     for bucket in ("writable", "readonly"):
-        arr = la.get(bucket) or []
-        for v in arr:
+        for v in (la.get(bucket) or []):
             keys.append(str(v))
     return keys
 
-def parse_pump_action(client: Client, target_addr: str, sig: str) -> List[Dict[str, Any]]:
-    """
-    Ritorna eventi:
-      { 'kind': 'BUY'|'SELL', 'mint': str, 'sol_delta': float, 'token_delta': float, 'sig': str }
-    token_delta > 0 => BUY (target aumenta token), <0 => SELL.
-    """
-    out: List[Dict[str, Any]] = []
-    tx = _get_tx_json_parsed(client, sig)
+def parse_events(client: Client, target_addr: str, sig: str) -> List[Dict[str, Any]]:
+    """Rileva BUY (token in aumento) usando pre/postTokenBalances; fallback su transferChecked in innerInstructions."""
+    tx = _get_tx_parsed(client, sig)
     if not tx:
-        return out
-
-    meta = tx.get("meta") or {}
-    pre_bal = meta.get("preBalances") or []
-    post_bal = meta.get("postBalances") or []
+        return []
     msg = ((tx.get("transaction") or {}).get("message")) or {}
-    account_keys = _collect_all_account_keys(msg)
+    keys = _account_keys(msg)
+    meta = tx.get("meta") or {}
 
-    # calcolo lamports_delta se troviamo l'indice del target tra tutte le keys (incluse LUT)
+    # lamports delta (non usato per decisione BUY/SELL ma lo logghiamo)
     lamports_delta = 0
     try:
-        idx = account_keys.index(target_addr)
+        idx = keys.index(target_addr)
+        pre_bal = meta.get("preBalances") or []
+        post_bal = meta.get("postBalances") or []
         if idx < len(pre_bal) and idx < len(post_bal):
             lamports_delta = (post_bal[idx] - pre_bal[idx])
     except ValueError:
-        lamports_delta = 0  # non bloccare la rilevazione: useremo i delta token
+        pass
 
-    pre_tokens = meta.get("preTokenBalances") or []
-    post_tokens = meta.get("postTokenBalances") or []
+    # 1) balances path
+    pre_map = {r.get("mint"): float((r.get("uiTokenAmount") or {}).get("uiAmount") or 0.0)
+               for r in (meta.get("preTokenBalances") or [])
+               if (r.get("owner") == target_addr) or (r.get("accountIndex") is not None and 0 <= int(r["accountIndex"]) < len(keys) and keys[int(r["accountIndex"])] == target_addr)}
+    post_map = {r.get("mint"): float((r.get("uiTokenAmount") or {}).get("uiAmount") or 0.0)
+               for r in (meta.get("postTokenBalances") or [])
+               if (r.get("owner") == target_addr) or (r.get("accountIndex") is not None and 0 <= int(r["accountIndex"]) < len(keys) and keys[int(r["accountIndex"])] == target_addr)}
 
-    def to_map(recs):
-        m: Dict[str, tuple[float, int]] = {}
-        for r in recs:
-            owner = r.get("owner")
-            acct_idx = r.get("accountIndex")
-            owner_pk = owner
-            if owner_pk is None and acct_idx is not None:
-                try:
-                    ai = int(acct_idx)
-                    if 0 <= ai < len(account_keys):
-                        owner_pk = account_keys[ai]
-                except Exception:
-                    pass
-            if owner_pk != target_addr:
-                continue
-            mint = r.get("mint")
-            ui = r.get("uiTokenAmount") or {}
-            try:
-                amt = float(ui.get("uiAmount") or 0.0)
-            except Exception:
-                amt = 0.0
-            dec = int(ui.get("decimals") or 6)
-            if mint:
-                m[mint] = (amt, dec)
-        return m
-
-    pre_map = to_map(pre_tokens)
-    post_map = to_map(post_tokens)
-    all_mints = set(pre_map.keys()) | set(post_map.keys())
-
-    pump_only = getattr(config, "PUMP_ONLY", True)
-
+    events: List[Dict[str, Any]] = []
+    all_mints = set(pre_map) | set(post_map)
     for mint in all_mints:
         if not mint:
             continue
-        if pump_only and not mint.endswith("pump"):
+        if config.PUMP_ONLY and not mint.endswith("pump"):
             continue
-        pre_amt, _ = pre_map.get(mint, (0.0, 6))
-        post_amt, _ = post_map.get(mint, (0.0, 6))
-        delta = post_amt - pre_amt
-        if abs(delta) < 1e-12:
-            continue
-        kind = "BUY" if delta > 0 else "SELL"
-        out.append({
-            "kind": kind,
-            "mint": mint,
-            "token_delta": delta,
-            "sol_delta": lamports_to_sol(lamports_delta) if lamports_delta else 0.0,
-            "sig": sig,
-        })
-    return out
+        delta = (post_map.get(mint, 0.0) - pre_map.get(mint, 0.0))
+        if delta > 1e-12:  # BUY
+            events.append({"kind": "BUY", "mint": mint, "token_delta": delta, "sol_delta": lamports_to_sol(lamports_delta), "sig": sig})
+
+    if events:
+        return events
+
+    # 2) fallback: innerInstructions -> transfer/transferChecked
+    ii = meta.get("innerInstructions") or []
+    for inner in ii:
+        for ins in inner.get("instructions") or []:
+            parsed = ins.get("parsed")
+            program = ins.get("program") or ins.get("programId")
+            if not parsed or str(program).lower() not in ("token", "spl-token"):
+                continue
+            if parsed.get("type") not in ("transfer", "transferChecked"):
+                continue
+            info = parsed.get("info") or {}
+            mint = info.get("mint")
+            if not mint:
+                continue
+            if config.PUMP_ONLY and not mint.endswith("pump"):
+                continue
+            dest = info.get("destination")
+            if dest == target_addr:
+                amt_ui = None
+                if "tokenAmount" in info:
+                    try:
+                        amt_ui = float(info["tokenAmount"].get("uiAmount") or 0.0)
+                    except Exception:
+                        amt_ui = None
+                if amt_ui is None:
+                    try:
+                        amt_ui = float(info.get("amount"))
+                    except Exception:
+                        continue
+                events.append({"kind": "BUY", "mint": mint, "token_delta": amt_ui, "sol_delta": lamports_to_sol(lamports_delta), "sig": sig})
+    return events

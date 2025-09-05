@@ -1,8 +1,11 @@
-solana>=0.36,<0.38
-solders>=0.26,<0.27
-construct==2.10.68
+# Networking & utils
+requests
+python-dotenv
+base58
 
-requests>=2.32
-python-dotenv>=1.0
-base58>=2.1
-typing-extensions>=4.12
+# Solana
+solana==0.30.2
+solders==0.18.1
+
+# Logging
+colorama
