@@ -1,49 +1,73 @@
-# src/jupiter.py — integrazione Jupiter Quote/Swap con firma locale
-import base64
+from __future__ import annotations
+from typing import Optional, Dict, Any
 import requests
-from solders.transaction import VersionedTransaction
-from solana.rpc.types import TxOpts
-from . import config
 
-def jup_quote(input_mint: str, output_mint: str, amount: int, slippage_bps: int):
-    url = f"{config.JUP_BASE}/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount}&slippageBps={slippage_bps}"
-    r = requests.get(url, timeout=20)
-    r.raise_for_status()
-    data = r.json()
-    routes = data.get("data") or []
-    return routes[0] if routes else None
+from .solana_utils import send_and_confirm_b64_tx
 
-def jup_swap(user_pubkey: str, route: dict) -> str:
-    """Ritorna la transazione base64 (swapTransaction) da firmare."""
-    url = f"{config.JUP_BASE}/swap"
-    payload = {
-        "userPublicKey": user_pubkey,
-        "wrapAndUnwrapSol": True,
-        "useSharedAccounts": True,
-        "asLegacyTransaction": False,
-        "dynamicComputeUnitLimit": True,
-        "dynamicSlippage": False,
-        "quoteResponse": route,
-    }
-    r = requests.post(url, json=payload, timeout=30)
-    r.raise_for_status()
-    data = r.json()
-    tx_b64 = data.get("swapTransaction")
+class JupiterClient:
+    def __init__(self, base_url: str = "https://quote-api.jup.ag/v6"):
+        self.base = base_url.rstrip("/")
+
+    def quote(
+        self,
+        input_mint: str,
+        output_mint: str,
+        amount_in_lamports: int,
+        slippage_bps: int = 100,
+        only_direct_routes: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        params = {
+            "inputMint": input_mint,
+            "outputMint": output_mint,
+            "amount": str(amount_in_lamports),
+            "slippageBps": str(slippage_bps),
+            "onlyDirectRoutes": str(only_direct_routes).lower(),
+        }
+        r = requests.get(f"{self.base}/quote", params=params, timeout=20)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        # api v6: una singola route in 'data' o lista?
+        if isinstance(data, dict) and "data" in data:
+            routes = data["data"]
+            if isinstance(routes, list) and routes:
+                return routes[0]
+            if isinstance(routes, dict):
+                return routes
+        return None
+
+    def swap_tx_b64(self, quote: Dict[str, Any], user_pubkey: str) -> Optional[str]:
+        payload = {
+            "userPublicKey": user_pubkey,
+            "quoteResponse": quote,
+            "wrapAndUnwrapSol": True,
+            "dynamicComputeUnitLimit": True,
+            "prioritizationFeeLamports": "auto",
+        }
+        r = requests.post(f"{self.base}/swap", json=payload, timeout=25)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        # risposta tipica: { "swapTransaction": "<base64>" }
+        return data.get("swapTransaction")
+
+def execute_swap_via_jupiter(
+    client_rpc,
+    jup: JupiterClient,
+    user_pubkey: str,
+    input_mint: str,
+    output_mint: str,
+    amount_in_lamports: int,
+    slippage_bps: int,
+) -> Optional[str]:
+    q = jup.quote(input_mint, output_mint, amount_in_lamports, slippage_bps)
+    if not q:
+        return None
+    tx_b64 = jup.swap_tx_b64(q, user_pubkey)
     if not tx_b64:
-        raise RuntimeError("Jupiter non ha restituito una transazione di swap.")
-    return tx_b64
-
-def sign_and_send(client, keypair, tx_b64: str) -> str:
-    """Decodifica base64, firma col keypair, invia con TxOpts."""
-    raw = base64.b64decode(tx_b64)
-    tx = VersionedTransaction.from_bytes(raw)
-    tx = VersionedTransaction(tx.message, [keypair])
-    raw_signed = bytes(tx)
-    resp = client.send_raw_transaction(raw_signed, opts=TxOpts(skip_preflight=False, max_retries=5))
+        return None
     try:
-        return str(resp.value)
+        sig = send_and_confirm_b64_tx(client_rpc, tx_b64)
+        return sig
     except Exception:
-        try:
-            return str(resp["result"])
-        except Exception:
-            return str(resp)
+        return None

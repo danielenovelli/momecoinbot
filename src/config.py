@@ -28,6 +28,7 @@ ENABLE_PUMPFUN = os.getenv("ENABLE_PUMPFUN", "true").lower() == "true"
 PUMPFUN_BASE = os.getenv("PUMPFUN_BASE", "https://pumpportal.fun/api")
 PUMPFUN_API_KEY = os.getenv("PUMPFUN_API_KEY", "").strip()
 PUMPFUN_MODE = os.getenv("PUMPFUN_MODE", "local").lower()  # local | lightning
+PUMP_ONLY = (os.getenv("PUMP_ONLY", "true").lower() == "true")
 
 # Mode
 TEST_MODE = os.getenv("TEST_MODE", "false").lower() == "true"
